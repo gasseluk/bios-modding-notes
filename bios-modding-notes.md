@@ -135,16 +135,15 @@ The handle token is `0x0601` --> Find the setup entry that controls this item. W
 
 From the Socket 462 Workshop we know that enumeration setup items have this format:
 
-|||||||
-|-|-|-|-|-|-|
 | Enum Ident | Token | CMOS Index/Mask Word | Cfg | Help | Label[0] | Label[1] |
+|-|-|-|-|-|-|-|
 | 1B | 2B | 2B | 1B | 1+2B | 2B | 2B |
 
 Assuming this setting is an enumeration, we expect someting like this:
 
-| Enum Ident | Token | CMOS Index/Mask Word | Cfg | Help |  |
+| Enum Ident | Token | CMOS Index/Mask Word | Cfg | Help | Labels |
 |-|-|-|-|-|-|
-| 01 | 0601 | ??? |...|...|
+| 01 | 0601 | ???? |...|...|...|
 
 The search pattern is then `01 01 06`:
 
@@ -167,8 +166,8 @@ Looking up the values in AMIBCP shows:
 
 ![CFG lock strings values](res/CFG_lock_strings_values.PNG)
 
-Value 0 = Enabled => Config locked
-Value 1 = Disabled => Config NOT locked
+- Value 0 = Enabled => Config locked
+- Value 1 = Disabled => Config NOT locked
 
 A search in the code for the CMOS mask `B7 16` returns multiple results. Each must be checked. With a little practice, it becomes easier to discern code sections from data sections by looking at the hex code... In doubt, disassemble each search result.
 
