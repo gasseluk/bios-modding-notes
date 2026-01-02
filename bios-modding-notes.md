@@ -259,18 +259,219 @@ With the multipliers adjusted from 3/4 to 1, the lowest UCLK value is always val
 
 This is the most difficult part. Module 55 uses both PCI config space and CMOS values to access configuration stuff.
 
-TBD:
+Module 55 is easily disassembled in IDA.
 
-- How to find the relevant section?
-- Dev 3 Func 4 Offset 50 / 54
-- 0x85 = 133 = BCLK used for calculations
-- [esi + 0x1B5E] = UCLK
-- [esi + 0x0E94] = New MCLK
-- [esi + 0x03DD] = New Mem Multi
+Let's search for the CMOS values
+- Immediate: No result
+- Byte sequence `B8 53 35`: No result
+- Same for `B8 E8 53`
+
+Then PCI config space is the next guess.
+
+In the datasheet we find a few interesting entries by searching for `UCLK` and `QCLK`:
+
+| Register | PCI | Description |
+|-|-|-|
+| `CURRENT_UCLK_RATIO` | 0:0:C0 | RO register to read UCLK ratio, 7 bits |
+| `MC_CHANNEL_n_TX_BG_SETTINGS` | [4,5,6]:0:C0 | Config register for the UCLK/QCLK domain crossing TX |
+| `MC_CHANNEL_n_RX_BGF_SETTINGS` | [4,5,6]:0:C8 | Same for RX |
+| `MC_DIMM_CLK_RATIO_STATUS` | 3:4:50 | RO register to read DIMM clk ratio and max ratio |
+| `MC_DIMM_CLK_RATIO` | 3:4:54 | RW register to set DIMM clk ratio |
+
+To find PCI space access, let's use the immediate find function in IDA. It limits the results because it requires search values to really be immediate values for instructions like `mov` or `push` wich are often used to supply arguments to function calls.
+
+First try `0x54` for the DIMM_CLK_RATIO:
+
+![IDA search for 0x54](res/IDA_search_54.PNG)
+
+A crapton of results. We only care for results which use the value as an immediate for a push or mov instruction, not as an immediate offset of a pointer dereference or an operand for a math operation or stack pointer adjustment.
+
+![IDA search highlighted](res/IDA_search_54_highlighted.PNG)
+
+First search result:
+
+![IDA PCI access](res/IDA_PCI_access.PNG)
+
+Let's have a closer look at some interesting sections:
+
+```asm
+...
+mov     bl, [esp+8+arg_8]
+...
+add     bl, 4          ; Prepare BX to contain an argument
+push    54h ; 'T'      ; 1. arg, our search result
+push    0              ; 2. arg
+push    ebx            ; 3. arg, see above
+push    eax            ; 4. arg, likely the value to write
+push    esi            ; 5. arg, some context?
+call    sub_4F86       ; Function call -> let's examine that function
+```
+
+![PCI write function](res/IDA_PCI_access_func.PNG)
+
+The Intel doc about accessing PCIe config registers states this:
+
+![Intel PCIe access](res/Intel_PCIe_access.PNG)
+
+We have:
+- Bus:  Bit 20
+- Dev:  Bit 15
+- Func: Bit 12
+
+That's what we see in the code:
+
+```asm
+shl eax, 5  ; Bus = 12 + 3 + 5 = 20
+...
+shl eax, 3  ; Dev = 12 + 3 = 15
+..
+shl eax, C  ; Func = 12
+```
+
+From the very bottom, we see that it's a write function:
+
+```asm
+mov [eax], ecx  ; value is stored in ECX
+```
+
+Now everywhere `sub_4F86` is called, we know that it's a PCI config space write access.
+
+If we break down the caller above, we see that it supplies the following args:
+
+- 54h : Offset
+- 00h : Func
+- ebx : arg_8 + 4h => Dev
+
+This is a write operation to the `MC_CHANNEL_n_DIMM_INIT_CMD` register, where `n` is supplied as `arg_8` into the function. This function is likely used to train the memory.
+
+To find our section of interest, let's cycle through the search results and find the section where e.g. `C0` offset is read.
+
+![IDA search C0](res/IDA_search_C0.PNG)
+
+First search result is in `sub_8CB2`. It is a very long routine. We'll look at some interesting points:
+
+![IDA read max DRAM clk ratio](res/IDA_loc_8D31_read_max_ratio.PNG)
+
+This section reads 32 bit from PCI reg 3:4:50 (`MC_DIMM_CLK_RATIO_STATUS`) and shifts the content right by 25 bits, therefore extracting the `MAX_RATIO` field from the register. So far nothing interesting.
+
+Next section is here:
+
+![IDA read UCLK and QCLK ratios](res/IDA_loc_8E8D_read_UCLK_QCLK_ratio.PNG)
+
+```asm
+xor     eax, eax                     ; eax = 0
+mov     al, [esi+1B55h]              ; al = active memory channel [0..2]
+; Grab the UCLK ratio
+push    0C0h                         ; Offset = 0C
+push    edi                          ; Func = 0 (EDI is 0, see above)
+push    edi                          ; Dev = 0
+push    eax                          ; Arg = memory channel
+push    esi
+call    sub_4E6A                     ; 8 bit read from `CURRENT_UCLK_RATIO`, result in AL
+mov     [esi+1B5Eh], al              ; store UCLK_RATIO into struct at 0x1B5E
+movzx   eax, al                      ; make UCLK_RATIO a 32 bit value
+mov     ecx, eax                     ; copy UCLK_RATIO into ECX
+cdq                                  ; make UCLK_RATIO a 64 bit value in EDX:EAX
+imul    ecx, 85h                     ; ECX = UCLK_RATIO * 133 = UCLK_VALUE
+push    3
+pop     ebx                          ; EBX = 3
+idiv    ebx                          ; EAX = UCLK_RATIO / 3
+; Initiate another PCI op
+push    50h ; 'P'                    ; Offset = 50
+push    4                            ; Func = 4
+push    3                            ; Dev = 3
+; Gotta calculate some value inbetween
+add     ecx, eax                     ; Genius: Adjust the eff. clock bc. the 1/3 fraction was omitted in 133
+mov     eax, 0F4240h                 ; EAX = 1'000'000
+cdq                                  ; make EAX 64 Bit
+idiv    ecx                          ; EAX = 1'000'000 / UCLK_VALUE
+mov     [esi+1B6Ah], eax             ; store in 1B6A
+movzx   eax, byte ptr [esi+0E94h]    ; EAX = QCLK_RATIO
+imul    eax, 7                       ; EAX = QCLK_RATIO * 7
+mov     bl, [eax+esi+3DDh]           ; BL = some lookup with QCLK_RATIO
+xor     eax, eax                     ; EAX = 0
+mov     al, [esi+1B55h]              ; AL = active memory channel
+mov     byte ptr [ebp+var_5], bl     ; var_5 = looked-up value
+; PCI read continues...
+push    eax                          ; Arg = memory channel
+push    esi
+call    sub_4EC3                     ; 32 bit read from `MC_DIMM_CLK_RATIO_STATUS`
+movzx   edx, bl                      ; EDX = looked-up value
+mov     [ebp+var_10], eax            ; var_10 = MC_DIMM_CLK_RATIO_STATUS register
+and     eax, 1Fh                     ; Mask bits 4:0 -> QCLK_RATIO
+add     esp, 28h
+cmp     edx, eax                     ; compare looked-up value to QCLK_RATIO
+jz      short loc_8F16               ; if equal, jump, otherwise:
+push    [ebp+var_5]                  ; arg1 = looked-up value
+push    esi                          ; arg2 = some context?
+call    sub_3681                     ; update QCLK_RATIO in 0x0E94
+pop     ecx
+pop     ecx
+```
+
+After this section we have both UCLK and QCLK in the memory. UCLK is located in 0x1B5E, QCLK is in 0x0E94.
+
+Going on, the code check if it it a 45nm or a 32nm cpu at `loc_8F16`. It does so by comparing the device id (DID) of Device 0, Func 0, Offset 0 (Intel QuickPath Architecture Generic Non-core Registers) with the value `0x2C70` which is the value found in 32nm processors.
+
+![Intel PCI DID 32nm](res/Intel_DID_32nm.PNG)
+
+Next let's check the 45nm part (left side), which is the easier to understand:
+
+![UCLK adjustment Mod 55](res/UCLK_adjust_55.PNG)
+
+```asm
+xor     eax, eax                    ; EAX = 0
+mov     al, [esi+1B5Eh]             ; AL = UCLK_RATIO
+lea     ecx, [edx+edx]              ; ECX = EDX * 2 = looked-up value * 2, likely QCLK_RATIO * 2
+movzx   edx, al                     ; EDX = UCLK_RATIO
+cmp     ecx, edx                    ; Compare QCLK_RATIO * 2 with UCLK_RATIO
+jle     short loc_8FF9              ; if (2*QCLK <= UCLK) jump off
+shr     al, 1                       ; AL = QCLK / 2
+push    eax                         ; arg1 = QCLK / 2
+push    esi                          
+call    sub_3681                    ; store QCLK / 2 in 0x0E94h
+movzx   eax, byte ptr [esi+0E94h]   ; retrieve 0x0E94h value
+imul    eax, 7                      ; deja vu, get the adjusted QCLK value
+mov     bl, [eax+esi+3DDh]          ; ...
+pop     ecx
+pop     ecx
+mov     byte ptr [ebp+var_5], bl
+```
+
+Ok, we have definitely found the place where the unwanted stuff happens.
+
+The mod is simple, make sure to always skip the adjustment:
+
+```asm
+; Compare 
+cmp     eax, eax                    ; Triggers ZF set -> jle will always jump
+jle     short loc_8FF9              ; if (ZF set) jump off`
+```
+
+Use the online assembler or any assembler of choice to assemble `cmp eax, eax` => `39 C0`.
+
+In the hex editor, change `3B CA` to `39 C0`, that's it.
 
 ![UCLK mod module 55](res/UCLK_mod_55.PNG)
 
-# Interesting Addresses
+For 32nm I won't do the ASM math here again, but clearly this section does the same thing but somewhat more stuff involved (which I did not bother to analyze).
+
+Some interesting struct offsets:
+
+- `[esi + 0x1B5E]` = UCLK ratio
+- `[esi + 0x1B55]` = Active Memory Channel
+- `[esi + 0x0E94]` = QCLK ratio
+- `[esi + 0x03DD]` = Mem Multiplier LUT
+
+### Flashing the Modded BIOS
+
+Use MMTOOL to replace the modules in the .rom file.
+
+Then flash the file using a CH341 programmer or equivalent.
+
+Users reported that it cannot be flashed with AFU. The setup will accept lower UCLK values but it will not apply at boot. My take is that with AFU, the module 55 is not flashed and therefore the DRAM clock ratio is adjusted during memory init.
+
+# Addresses and Offsets
 
 During BIOS analysis, I noted some addresses and offsets of values inside the modules and structures. These are usually referenced as shown in the below assembly snippet (IDA).
 
@@ -282,6 +483,32 @@ The CMOS values are only valid for the R3E bios 1502. Probably the offsets in th
 |-|-|
 | 4032B | Memory Clock Values Table |
 | 40692 | UCLK Values Table |
+
+## Module 55 Sections
+
+Some subroutines of interest in the module 55:
+
+| Address | What |
+|-|-|
+| sub_4E6A | PCI config space read function **8 bit** |
+| sub_4E96 | PCI config space read function **16 bit** |
+| sub_4EC3 | PCI config space read function **32 bit** |
+| sub_4F22 | PCI config space write function **8 bit** |
+| sub_4F53 | PCI config space write function **16 bit** |
+| sub_4F86 | PCI config space write function **32 bit** |
+| sub_52A3 | Compare PCI Device ID |
+| sub_5B9F | Write memory timings to HW registers |
+| sub_8CB2 | UCLK check and much more stuff |
+| sub_92CF | Write the definitive UCLK into the HW registers |
+| sub_12E21 | Write to DRAM MRS registers -> send commands to DRAM sticks |
+| sub_18C5B | Main memory training routine |
+| sub_18E7C | Display POST code XX |
+| sub_19D11 | DRAM clock speed LUT |
+| sub_1A029 | Read DRAM multi and convert to CMOS value |
+| sub_1A306 | ? |
+| sub_1A9B6 | Sanity check for tCL, evaluation of tRAS, tRFC |
+
+
 
 
 ## CMOS Indices
@@ -299,7 +526,7 @@ The values read from here have values in the format as they are stored in the CM
 | 3548 | XMP on/off | ? |
 | 44AC | tCL | ? |
 | 44B0 | ? | ? |
-| 53D8 | ? | ? |
+| 53D8 | tRAS | ? |
 | 25E8 | ? | ? |
 | 7348 | ? | ? |
 | 8318 | ? | ? |
@@ -325,9 +552,9 @@ lcall 0x4000 0x1cc1    ; Call CMOS read routine
 ; Result in BX
 ```
 
-## Module 55 Struct Offsets
+## Module 55 Timing Values
 
-This seems to be a structure where the configuration values are stored for later write into the registers. Originally these are calculated using an auto routine or copied from the CMOS values.
+This seems to be a structure where the timing values are stored for later write into the registers. Originally these are calculated using an auto routine or copied from the CMOS values.
 
 | Offset | Value |
 |-|-|
@@ -335,8 +562,10 @@ This seems to be a structure where the configuration values are stored for later
 | 12h | tRCD |
 | 13h | tRP |
 | 14h | tRAS |
+| 15h | tRRD ? |
 | 16h | tWTR |
 | 17h | tRTP |
+| 18h | tFAW ? |
 | 20h | tRFC |
 
 ```asm
@@ -347,15 +576,58 @@ mov al, [edi+11h]      ; dereference struct offset
 
 Access for these values can be searched for in IDA using the immediate value search (alt + i).
 
+The memory timing sequence looks as follows in IDA:
+
+![IDA memory timing write](res/IDA_memory_timings_write.PNG)
+
+The values are loaded into register from the struct, e.g. `[edi+20h]`. Then shifted to the proper location and masked with a limit value using `sub_56CA`, then written into the according PCI config register using `sub_4F86`.
+
+## PCI Config Space
+
+These are straight from the processor datasheet.
+
+- Device 0: Uncore
+- Device 2: QPI
+- Device 3: IMC
+- Device 4: Memory Channel 0
+- Device 5: Memory Channel 1
+- Device 6: Memory Channel 2
+
+### Some Registers
+
+| Address [PCI] | Register | Description |
+|-|-|-|
+| 0:0:C0  | `CURRENT_UCLK_RATIO` | RO register to read UCLK ratio, 7 bits |
+| [4,5,6]:0:80  | `MC_CHANNEL_n_RANK_TIMING_A` | 3rds (back-to-back w-r, r-w, r-r) |
+| [4,5,6]:0:84  | `MC_CHANNEL_n_RANK_TIMING_B` | 3rds (back-to-back w-w), tRRD, tFAW |
+| [4,5,6]:0:88  | `MC_CHANNEL_n_BANK_TIMING` | tWR, tRTP, tRCD, tRAS, tRP |
+| [4,5,6]:0:8C  | `MC_CHANNEL_n_REFRESH_TIMING` | tRFC, tREFI |
+| [4,5,6]:0:90  | `MC_CHANNEL_n_CKE_TIMING` | tCKE, tXP, etc.|
+| [4,5,6]:0:C0  | `MC_CHANNEL_n_TX_BG_SETTINGS` | Config register for the UCLK/QCLK domain crossing TX |
+| [4,5,6]:0:C8  | `MC_CHANNEL_n_RX_BGF_SETTINGS` | Same for RX |
+| 3:4:50  | `MC_DIMM_CLK_RATIO_STATUS` | RO register to read DIMM clk ratio and max ratio |
+| 3:4:54  | `MC_DIMM_CLK_RATIO` | RW register to set DIMM clk ratio |
+
+## AMI SLAB
+
+The AMI Single Link Arch BIOS can be split into its individual sections. For my analysis this was not necessary because from the execution perspective, this is handled as one binary with static linking, therefore no split needed.
+
+Unfortunately I found no reasonable way to disassemble it as a whole to display all cross-references like with a PE32 image in IDA. This makes tracing calling locations difficult, for only the forward path can be evaluated with the code directly.
+
+The SLAB's content has been searched through by other users already, therefore I will not dig into this more.
+
+Other than the AMIBIOS8_1B_Utils there is a tool in the coreboot repository `ami_slab`. I compiled it for win32 and used it to extract the data from the SLAB. It basically works but some windows components adds LF characters after 0D in a good intention but therefore ruins the whole binary. Maybe if it is used on linux, it would work properly.
+
 # Tools
 
 - IDA Freeware (I used 7.0.191002)
 - ImHEX: https://github.com/WerWolv/ImHex
 - Online assembler: https://defuse.ca/online-x86-assembler.htm
-- 1B utils: https://github.com/pinczakko/AMIBIOS8_1B_Utils
-- AMIBCP
+- AMIBIOS8 1B utils: https://github.com/pinczakko/AMIBIOS8_1B_Utils
+- ami_slab (coreboot): https://github.com/coreboot/bios_extract/blob/master/src/ami_slab.c
+- AMIBCP 3.5.1
 - MMTOOL V3.22 BKMOD
-
+- ChatGPT (top for explaining assembly sequences)
 
 # References
 
